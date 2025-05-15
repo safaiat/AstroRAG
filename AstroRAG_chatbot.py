@@ -1,5 +1,3 @@
-# multi_source_rag_chatbot.py
-
 import os
 import faiss
 import requests
@@ -11,17 +9,17 @@ import sys
 import time
 import threading
 import random
+from collections import Counter
 from transformers import Qwen2Tokenizer, Qwen2ForCausalLM, GenerationConfig
 from transformers.utils import logging
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import ads
 
-# === SUPPRESS WARNINGS ===
+# === CONFIGURATION ===
 warnings.filterwarnings("ignore")
 logging.set_verbosity_error()
 
-# === CONFIG ===
 HF_CACHE = "/gpfs/wolf2/olcf/trn040/scratch/8mn/hf_cache"
 MODEL_PATH = "/gpfs/wolf2/olcf/trn040/scratch/8mn/project1/qwen2.5-7b"
 ads.config.token = "rWD23vPXVZzKB0TeSzEfcnfZKwYUBUmPxKPYwGO3"
@@ -31,7 +29,6 @@ os.environ.update({
     "SENTENCE_TRANSFORMERS_HOME": HF_CACHE
 })
 
-# === LOAD MODELS ===
 tokenizer = Qwen2Tokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
 model = Qwen2ForCausalLM.from_pretrained(
     MODEL_PATH, local_files_only=True, torch_dtype="auto", device_map="auto"
@@ -39,64 +36,51 @@ model = Qwen2ForCausalLM.from_pretrained(
 model.eval()
 embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", cache_folder=HF_CACHE)
 
-# === THINKING ANIMATION ===
+# === UTILITIES ===
+def animated_typing(text, delay=0.03):
+    for char in text:
+        print(char, end='', flush=True)
+        time.sleep(delay)
+    print()
+
 def thinking_animation(stop_event):
     animations = ["dots", "spinner", "bounce"]
-    chosen_animation = random.choice(animations)
-
-    messages = [
+    chosen = random.choice(animations)
+    base = random.choice([
         "Searching the universe for your answer",
         "Consulting the galactic library",
         "Tuning into deep space frequencies",
         "Aligning the virtual telescope",
         "Analyzing interstellar signals"
-    ]
-    base_message = random.choice(messages)
-
-    # Animate base message once
+    ])
     sys.stdout.write("\r")
-    for c in base_message:
+    for c in base:
         sys.stdout.write(c)
         sys.stdout.flush()
         time.sleep(0.033)
 
-    if chosen_animation == "dots":
-        dots = ["   ", ".  ", ".. ", "..."]
-        i = 0
-        while not stop_event.is_set():
-            sys.stdout.write(f"\r{base_message}{dots[i % 4]}")
-            sys.stdout.flush()
-            time.sleep(0.4)
-            i += 1
-
-    elif chosen_animation == "spinner":
-        spinner = ["|", "/", "-", "\\"]
-        i = 0
-        while not stop_event.is_set():
-            sys.stdout.write(f"\r{base_message} {spinner[i % 4]}")
-            sys.stdout.flush()
-            time.sleep(0.2)
-            i += 1
-
-    elif chosen_animation == "bounce":
-        frames = ["(*   )", "( *  )", "(  * )", "(   *)","(  * )","( *  )","(*   )"]
-        i = 0
-        while not stop_event.is_set():
-            sys.stdout.write(f"\r{base_message} {frames[i % len(frames)]}")
-            sys.stdout.flush()
-            time.sleep(0.3)
-            i += 1
-
+    if chosen == "dots":
+        frames = ["   ", ".  ", ".. ", "..."]
+    elif chosen == "spinner":
+        frames = ["|", "/", "-", "\\"]
+    elif chosen == "bounce":
+        frames = ["(*   )", "( *  )", "(  * )", "(   *)", "(  * )", "( *  )", "(*   )"]
+    i = 0
+    while not stop_event.is_set():
+        frame = frames[i % len(frames)]
+        sys.stdout.write(f"\r{base} {frame}")
+        sys.stdout.flush()
+        time.sleep(0.3)
+        i += 1
     sys.stdout.write("\r" + " " * 80 + "\r")
 
+def extract_keywords(text, top_n=5):
+    text = re.sub(r"[^a-zA-Z0-9\s\-]", "", text.lower())
+    words = text.split()
+    filtered = [w for w in words if w not in ENGLISH_STOP_WORDS and len(w) > 2]
+    freq = Counter(filtered)
+    return sorted(set([word for word, _ in freq.most_common(top_n)]))
 
-# === KEYWORD EXTRACTION ===
-def extract_keywords(query):
-    query_clean = re.sub(r"[^a-zA-Z0-9\s]", "", query)
-    words = query_clean.lower().split()
-    return sorted(set([w for w in words if w not in ENGLISH_STOP_WORDS and len(w) >= 2]))
-
-# === FETCH DOCUMENTS ===
 def fetch_ads_docs(keywords, max_docs=10):
     docs = []
     for kw in keywords:
@@ -119,7 +103,6 @@ def fetch_arxiv_docs(keywords, max_docs=10):
                 docs.append(f"[arXiv] {title}. {summary}")
     return docs
 
-# === VECTOR RETRIEVAL ===
 def build_context_vector_store(all_docs):
     vectors = embedder.encode(all_docs, convert_to_numpy=True)
     index = faiss.IndexFlatIP(vectors.shape[1])
@@ -131,12 +114,10 @@ def retrieve_top_k(query, all_docs, index, k=3):
     _, I = index.search(q_emb.reshape(1, -1), k)
     return [all_docs[i] for i in I[0]]
 
-# === CONTEXT TRUNCATION ===
 def truncate_context(context, max_tokens=950):
     words = context.split()
     return ' '.join(words[:max_tokens]) if len(words) > max_tokens else context
 
-# === ANSWER GENERATION ===
 def generate_answer(query, context):
     prompt = f"""You are an expert astrophysicist assistant. Respond concisely in English based on the context if relevant. If context lacks relevant data, answer based on scientific consensus. Use complete sentences. Avoid lists or bullet points.
 
@@ -157,97 +138,105 @@ Answer:
     decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return decoded.split("Answer:")[1].split("Human:")[0].strip() if "Answer:" in decoded else decoded.strip()
 
-# === MAIN LOOP ===
+# === MAIN CHAT LOOP ===
 if __name__ == "__main__":
-    character_name = "AstroRAG"
+    character_name = "AstroBot"
 
-    greeting = (
-        f"\n{character_name}: Hello! I'm your astrophysics assistant.\n"
-        "Ask a question about stars, planets, galaxies, or any cosmic topic.\n"
-        "Type 'exit' to quit.\n"
-    )
-    for char in greeting:
-        print(char, end="", flush=True)
-        time.sleep(0.033)
-
-    user_name = input("\nBefore we start, what's your name?\n> ").strip()
-    welcome_lines = [
-        f"Nice to meet you, {user_name}! Let's explore the universe together.",
-        f"Welcome aboard, {user_name}! Our cosmic journey begins.",
-        f"Great to have you here, {user_name}. Let's dive into space mysteries.",
-        f"{user_name}, ready to unlock the secrets of the stars? Let’s go!",
+    greetings = [
+        f"{character_name}: Ready to explore galaxies and gravitational waves?",
+        f"{character_name}: Welcome aboard! Let’s navigate the universe together.",
+        f"{character_name}: Ready to dive into black holes, stars, and strange new worlds?",
+        f"{character_name}: Curious about the cosmos? You’ve come to the right place!",
+        f"{character_name}: Let’s unfold the mysteries of the universe — ask away!",
+        f"{character_name}: I’ve just calibrated the telescope. What shall we observe?",
+        f"{character_name}: Whether it’s quasars or quantum foam — I’m here to help!",
+        f"{character_name}: Welcome, fellow stargazer! The universe is full of answers."
     ]
-    print(f"\n{character_name}: ", end="")
-    for c in random.choice(welcome_lines):
-        print(c, end="", flush=True)
-        time.sleep(0.033)
+    animated_typing("\n" + random.choice(greetings))
+    animated_typing(f"{character_name}: Ask a question about stars, planets, galaxies, or any cosmic topic.")
+    animated_typing(f"{character_name}: Type 'exit' to quit.")
 
-    last_sources = []
+    user_name = input(f"\n{character_name}: Let's get to know each other! I'm AstroBot, and you are?\n> ").strip()
+
+    name_greetings = [
+        f"{character_name}: {user_name}, ready to unlock the secrets of the stars? Let's go!",
+        f"{character_name}: Great to meet you, {user_name}! Let’s chase some cosmic mysteries together.",
+        f"{character_name}: Awesome, {user_name}. Fire away your questions and I’ll beam up the answers!",
+        f"{character_name}: Buckle up, {user_name}! The universe is calling.",
+        f"{character_name}: {user_name}, shall we surf some gravitational waves?",
+        f"{character_name}: Star charts are open, {user_name}. What shall we explore?",
+        f"{character_name}: {user_name}, cosmic knowledge is just a question away!",
+        f"{character_name}: Let’s map the Milky Way together, {user_name}. What’s on your mind?"
+    ]
+    animated_typing("\n" + random.choice(name_greetings))
+
+    last_sources = {}
+    last_keywords = []
+    follow_up = ""
 
     while True:
-        prompt_text = random.choice([
-            "What astrophysics concept are you curious about today?",
-            "Got a question about stars, planets, or galaxies? Ask away:",
-            "Ready to explore the cosmos? Type your question here:",
-            "Need help with a space-related topic? I'm all ears:",
-            "Shoot me your astrophysics question, cadet:",
-            "Let's study the universe! What's your question?"
-        ])
+        if follow_up:
+            temp_query = follow_up
+            follow_up = ""
+        else:
+            temp_query = input(f"\n{user_name}: ").strip()
 
-        print(f"\n\n{character_name}: ", end="", flush=True)
-        for char in prompt_text:
-            print(char, end="", flush=True)
-            time.sleep(0.033)
-        print()
+        normalized = temp_query.lower()
 
-        query = input(f"{user_name}: ").strip()
-
-        if query.lower() == "exit":
+        if normalized == "exit":
             print(f"{character_name}: Goodbye {user_name}! Keep exploring the stars.")
             break
 
-        elif query.lower().startswith("nn "):
-            new_name = query[3:].strip()
+        if normalized.startswith("nn "):
+            new_name = temp_query[3:].strip()
             if new_name:
                 user_name = new_name
-                print(f"{character_name}: Got it! I'll call you {user_name} now.")
-            continue
-
-        elif query.lower() == "help":
-            print(f"""\n{character_name}: Here’s what you can do:
-- Ask questions about space, astronomy, or astrophysics.
-- To change your name, type: nn NewName
-- To see sources used in your last question, type: source
-- To exit, type: exit\n""")
-            continue
-
-        elif query.lower() == "source":
-            if last_sources:
-                print(f"\n{character_name}: Full sources from your last question:\n")
-                for src in last_sources:
-                    print(f"{src}\n{'-'*60}")
+                animated_typing(f"{character_name}: Noted! I’ll call you {user_name} from now on.")
+                animated_typing("\n" + random.choice(name_greetings).replace(user_name, new_name))
             else:
-                print(f"{character_name}: No sources yet. Ask something first.")
+                animated_typing(f"{character_name}: Hmm... you didn’t give me a name. Try again with: nn YourName")
             continue
 
-        keywords = extract_keywords(query)
-        if not keywords:
-            print("Sorry, I couldn't find meaningful keywords in your question.")
+        if normalized == "source":
+            if last_sources:
+                ads_count = len(last_sources["ads"])
+                arxiv_count = len(last_sources["arxiv"])
+                total_count = len(last_sources["all"])
+                print(f"\n{character_name}: Last used keywords -> {', '.join(last_keywords)}")
+                print(f"{character_name}: Retrieved documents - NASA ADS: {ads_count}, arXiv: {arxiv_count}, Total: {total_count}\n")
+                for i, src in enumerate(last_sources["all"], 1):
+                    print(f"[DOC {i}]: {src}\n{'-'*60}")
+                animated_typing(random.choice([
+                    f"{character_name}: Want to ask another big question about the universe? I'm all ears.",
+                    f"{character_name}: Wondering how something works in space? Try me.",
+                    f"{character_name}: I can help you dive deeper into any cosmic idea. What are you curious about next?",
+                    f"{character_name}: Any topic you want to unravel? I can help you explore it.",
+                    f"{character_name}: Curious minds make the best astronomers. Got another question?",
+                    f"{character_name}: Whether it's stars, space-time, or galaxies — just ask!",
+                    f"{character_name}: There's always more to discover. What shall we look into now?",
+                    f"{character_name}: You guide the telescope. What topic should we zoom in on next?"
+                ]))
+            else:
+                print(f"{character_name}: No sources retrieved yet. Ask a question first.")
             continue
 
+        query = temp_query
         stop_event = threading.Event()
         anim_thread = threading.Thread(target=thinking_animation, args=(stop_event,))
         anim_thread.start()
 
+        keywords = extract_keywords(query)
+        last_keywords = keywords
+
         ads_docs = fetch_ads_docs(keywords)
         arxiv_docs = fetch_arxiv_docs(keywords)
         all_docs = list(set(ads_docs + arxiv_docs))
-        last_sources = all_docs.copy()
+        last_sources = {"ads": ads_docs, "arxiv": arxiv_docs, "all": all_docs}
 
         if not all_docs:
             stop_event.set()
             anim_thread.join()
-            print("[INFO] No relevant documents retrieved.")
+            print(f"{character_name}: No relevant documents retrieved.")
             continue
 
         index, _ = build_context_vector_store(all_docs)
@@ -263,4 +252,26 @@ if __name__ == "__main__":
             print(char, end="", flush=True)
             time.sleep(0.033)
         print("\n")
-  
+
+        keywords = extract_keywords(answer)
+        last_keywords = keywords
+
+        if keywords:
+            followup_templates = [
+                f"{character_name}: Fascinating discovery, don’t you think? Perhaps you'd like to explore more about: {', '.join(keywords)}.",
+                f"{character_name}: These stellar terms popped up - {', '.join(keywords)}. Want to go deeper?",
+                f"{character_name}: The cosmos whispers secrets about: {', '.join(keywords)}. Curious to learn more?",
+                f"{character_name}: We just skimmed the surface! You could dive into topics like: {', '.join(keywords)}.",
+                f"{character_name}: The galactic trail leads us toward: {', '.join(keywords)}. Shall we follow it?"
+            ]
+
+            followup_prompt_templates = [
+                f"{character_name}: Or we could hop to an entirely different constellation of ideas, {user_name}. What’s your next curiosity?",
+                f"{character_name}: Or... is there another cosmic puzzle you're itching to solve, {user_name}?",
+                f"{character_name}: Or we could zoom out and tackle something new across the galaxy, {user_name}. Your call!",
+                f"{character_name}: Or shall we reroute to a brand new quadrant of the universe, {user_name}?",
+                f"{character_name}: Or… we could shift course toward something completely unexpected, {user_name}. Just say the word!"
+            ]
+
+            followup_text = random.choice(followup_templates) + "\n" + random.choice(followup_prompt_templates)
+            animated_typing(followup_text)
